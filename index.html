@@ -1,0 +1,149 @@
+<!-- frontend/index.html -->
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Women Safety AI Prototype — Demo</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <style>
+    body { margin:0; padding:0; font-family: Arial, Helvetica, sans-serif; }
+    #map { height: 70vh; }
+    #controls { padding: 10px; }
+    .btn { background:#ff4d6d; color:white; padding:10px;border:none;border-radius:6px; cursor:pointer; }
+    .muted { color:#666; font-size:0.9rem; }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <div id="controls">
+    <div>
+      <button id="setA" class="btn">Set Start (Click map)</button>
+      <button id="setB" class="btn">Set End (Click map)</button>
+      <button id="eval" class="btn">Evaluate Route Safety</button>
+      <button id="sos" class="btn">SOS</button>
+    </div>
+    <p id="status" class="muted">Set start & end by clicking map</p>
+    <div id="result"></div>
+    <hr/>
+    <h4>Report an Issue (crowdsource)</h4>
+    <input id="rdesc" placeholder="Describe (dark_road / harassment / unsafe_transport)" style="width:60%">
+    <button id="reportBtn" class="btn">Send Report</button>
+    <div id="reports" class="muted"></div>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    const backend = 'http://localhost:5000';
+    const map = L.map('map').setView([22.5726, 88.3639], 12); // Kolkata center, change as you like
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      attribution: '&copy; OSM'
+    }).addTo(map);
+
+    let A = null, B = null, markerA = null, markerB = null, poly = null;
+    let mode = null; // 'A' or 'B'
+    document.getElementById('setA').onclick = ()=>{ mode='A'; updateStatus('Click map to set START') }
+    document.getElementById('setB').onclick = ()=>{ mode='B'; updateStatus('Click map to set END') }
+
+    map.on('click', (e)=>{
+      if(!mode) return;
+      const latlng = e.latlng;
+      if(mode==='A'){
+        A = latlng;
+        if(markerA) markerA.setLatLng(latlng); else markerA = L.marker(latlng,{title:'Start'}).addTo(map).bindPopup('Start');
+      } else {
+        B = latlng;
+        if(markerB) markerB.setLatLng(latlng); else markerB = L.marker(latlng,{title:'End'}).addTo(map).bindPopup('End');
+      }
+      mode=null;
+      updateStatus('Start/End set');
+      drawLine();
+    });
+
+    function drawLine(){
+      if(poly) map.removeLayer(poly);
+      if(A && B){
+        poly = L.polyline([A,B], {color: 'blue'}).addTo(map);
+        map.fitBounds(poly.getBounds(), {padding:[50,50]});
+      }
+    }
+
+    document.getElementById('eval').onclick = async ()=>{
+      if(!A || !B){ updateStatus('Set both start and end'); return; }
+      updateStatus('Sampling route and querying backend...');
+      // sample 8 points along straight line
+      const samples = 8;
+      const points = [];
+      for(let i=0;i<=samples;i++){
+        const t = i/samples;
+        const lat = A.lat + t*(B.lat - A.lat);
+        const lon = A.lng + t*(B.lng - A.lng);
+        points.push({lat,lon});
+      }
+      // for each point, call backend predict_safety with heuristics
+      const scores = [];
+      for(let p of points){
+        // simple heuristics from map: simulate lighting by latitude (demo only)
+        const payload = {
+          hour: new Date().getHours(),
+          crime_rate: Math.random()*0.4 + 0.1,
+          lighting: Math.random()*0.6 + 0.3,
+          crowd: Math.random()*0.7 + 0.1,
+          prox_police: Math.abs((Math.random()*5)),
+          recent_reports: Math.floor(Math.random()*2)
+        };
+        try{
+          const res = await fetch(backend+'/predict_safety', {
+            method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)
+          });
+          const js = await res.json();
+          scores.push(js.safety_score);
+          // plot small circle colored by score
+          const color = js.safety_score >= 75 ? 'green' : (js.safety_score >=45 ? 'orange' : 'red');
+          L.circle([p.lat,p.lon], {radius:30, color: color, fillOpacity:0.2}).addTo(map);
+        }catch(err){
+          console.error(err);
+        }
+      }
+      const avg = scores.reduce((a,b)=>a+b,0)/scores.length;
+      document.getElementById('result').innerHTML = `<h3>Route safety score: ${avg.toFixed(2)} / 100</h3>
+        <p class="muted">${avg>=75?'Safe':(avg>=45?'Moderate':'High Risk')}</p>`;
+      updateStatus('Done');
+    };
+
+    // SOS
+    document.getElementById('sos').onclick = async ()=>{
+      // in real app you'd get auth & contacts etc.
+      const coords = map.getCenter();
+      const payload = { user_id: 'demoUser', lat: coords.lat, lon: coords.lng, contacts: [] };
+      await fetch(backend+'/sos', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});
+      alert('SOS sent (demo). In prod, authorities & contacts would be notified.');
+    };
+
+    // Reports
+    document.getElementById('reportBtn').onclick = async ()=>{
+      const desc = document.getElementById('rdesc').value || 'dark_road';
+      const coords = map.getCenter();
+      const payload = { lat: coords.lat, lon: coords.lng, type: desc, description: desc };
+      await fetch(backend+'/report', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});
+      document.getElementById('rdesc').value='';
+      alert('Report sent (demo).');
+      loadReports();
+    };
+
+    async function loadReports(){
+      try{
+        const res = await fetch(backend+'/reports');
+        const arr = await res.json();
+        const last = arr.slice(-5).reverse();
+        document.getElementById('reports').innerHTML = '<b>Recent reports:</b><br/>' + last.map(r=>`[${new Date(r.timestamp*1000).toLocaleString()}] ${r.type} @ ${r.lat.toFixed(3)},${r.lon.toFixed(3)}`).join('<br/>');
+      }catch(e){ console.log(e) }
+    }
+
+    function updateStatus(t){ document.getElementById('status').innerText = t; }
+
+    loadReports();
+
+  </script>
+</body>
+</html>
